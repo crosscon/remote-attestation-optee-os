@@ -1,6 +1,8 @@
 subdirs-$(CFG_TEE_CORE_EMBED_INTERNAL_TESTS) += tests
 
 srcs-$(CFG_ATTESTATION_PTA) += attestation.c
+srcs-y += memread.c
+srcs-$(CFG_MEMREAD_PTA) += memread.c
 srcs-$(CFG_TEE_BENCHMARK) += benchmark.c
 srcs-$(CFG_DEVICE_ENUM_PTA) += device.c
 srcs-$(CFG_TA_GPROF_SUPPORT) += gprof.c
