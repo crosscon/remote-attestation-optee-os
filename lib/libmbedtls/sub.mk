@@ -119,6 +119,7 @@ SRCS_TLS += ssl_cookie.c
 SRCS_TLS += ssl_srv.c
 SRCS_TLS += ssl_ticket.c
 SRCS_TLS += ssl_tls.c
+SRCS_TLS += ssl_msg.c
 
 srcs-y += $(addprefix mbedtls/library/, $(SRCS_CRYPTO))
 srcs-$(sm-$(ta-target)) += $(addprefix mbedtls/library/, $(SRCS_X509))
