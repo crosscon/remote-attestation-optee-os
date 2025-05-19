@@ -1,5 +1,8 @@
+#include "tee_api_defines.h"
 #include <string.h>
 #include <kernel/pseudo_ta.h>
+#include <mm/core_mmu.h>
+#include <mm/core_memprot.h>
 #include <pta_memread.h>
 
 //#include <tee_internal_api.h>
@@ -7,11 +10,113 @@
 #include <crypto/crypto.h>
 #include <tee_api_types.h>
 
+#include <config.h>
+
 #define PTA_NAME "memread.pta"
 
+#define MEMREAD_THIS_VM_ID      0
 
-#define MEMORY_REGION_START_ADDR  0x00
-#define MEMORY_REGION_SIZE        0x10
+
+int get_shared_ipc(struct vm_config* vm1, struct vm_config* vm2) {
+    for (size_t i = 0; i < vm1->platform.ipc_num; i++) {
+        for (size_t j = 0; j < vm2->platform.ipc_num; j++) {
+            if (vm1->platform.ipcs[i].shmem_id == vm2->platform.ipcs[j].shmem_id)
+                return vm1->platform.ipcs[i].shmem_id;
+        }
+    }
+
+    for (size_t i = 0; i < vm1->children_num; i++) {
+        int res = get_shared_ipc(vm1->children[i], vm2);
+        if (res >= 0)
+            return res;
+    }
+
+    for (size_t i = 0; i < vm2->children_num; i++) {
+        int res = get_shared_ipc(vm1, vm2->children[i]);
+        if (res >= 0)
+            return res;
+    }
+
+    for (size_t i = 0; i < vm1->children_num; i++) {
+        for (size_t j = 0; j < vm2->children_num; j++) {
+            int res = get_shared_ipc(vm1->children[i], vm2->children[j]);
+            if (res >= 0)
+                return res;
+        }
+    }
+
+    return -1;
+}
+
+int get_shmem_base_addr(struct vm_config* vm, size_t shmem_id) {
+    for (size_t ipc_idx = 0; ipc_idx < vm->platform.ipc_num; ipc_idx++) {
+        struct ipc ipc_ = vm->platform.ipcs[ipc_idx];
+
+        if (ipc_.shmem_id == shmem_id)
+            return ipc_.base;
+    }
+
+    return -1;
+}
+
+int get_shmem_size(struct vm_config* vm, size_t shmem_id) {
+    for (size_t ipc_idx = 0; ipc_idx < vm->platform.ipc_num; ipc_idx++) {
+        struct ipc ipc_ = vm->platform.ipcs[ipc_idx];
+
+        if (ipc_.shmem_id == shmem_id)
+            return ipc_.size;
+    }
+
+    return -1;
+}
+
+struct vm_mem_mapping {
+    size_t phy;
+    size_t virt_offset;
+    size_t size;
+};
+
+int get_vm_memory_mapping(size_t vm_idx, struct vm_mem_mapping* cfg) {
+    if (vm_idx >= config.vmlist_size) {
+        return -1;
+    }
+
+    struct vm_config* this_vm = config.vmlist[MEMREAD_THIS_VM_ID];
+    struct vm_config* other_vm = config.vmlist[vm_idx];
+
+    int shared_ipc = get_shared_ipc(this_vm, other_vm);
+    if (shared_ipc < 0)
+        return -1;
+
+    int shared_ipc_base = get_shmem_base_addr(this_vm, shared_ipc);
+    if (shared_ipc_base < 0)
+        return -1;
+
+    int shared_ipc_size = get_shmem_size(this_vm, shared_ipc);
+    if (shared_ipc_size < 0)
+        return -1;
+
+    cfg->phy = shared_ipc_base;
+    cfg->size = shared_ipc_size;
+
+    size_t offset = 0;
+    for (size_t i = 0; i < vm_idx; i++) {
+        if (i == MEMREAD_THIS_VM_ID)
+            continue;
+
+        other_vm = config.vmlist[i];
+
+        int shmem_id = get_shared_ipc(this_vm, other_vm);
+        if (shmem_id < 0)
+            continue;
+
+        offset += config.shmemlist[shmem_id].size;
+    }
+
+    cfg->virt_offset = offset;
+
+    return 0;
+}
 
 
 TEE_Result get_pattern_base_address_in_memory_region(size_t memory_start, size_t memory_size, const char* pattern, size_t pattern_size, size_t test_size, char* memory_to_hash) {
@@ -55,13 +160,24 @@ static TEE_Result invoke_command(
     char* output_buf = (char*) params[3].memref.buffer;
     size_t output_buf_size = params[3].memref.size;
 
+    struct vm_mem_mapping map;
+    if (get_vm_memory_mapping(vm_index, &map) < 0)
+        return TEE_ERROR_BAD_PARAMETERS;
+
+    void* vaddr = core_mmu_add_mapping(MEM_AREA_IO_NSEC, map.phy, map.size);
+    if (vaddr == NULL)
+        vaddr = phys_to_virt(map.phy, MEM_AREA_IO_NSEC, 1);
+
+    if (vaddr == NULL)
+        return TEE_ERROR_OUT_OF_MEMORY;
+
     char* memory_region_under_test;
-    res = get_pattern_base_address_in_memory_region(MEMORY_REGION_START_ADDR, MEMORY_REGION_SIZE, input_pattern, input_pattern_size, memory_region_under_test_size, memory_region_under_test);
+    res = get_pattern_base_address_in_memory_region((size_t) vaddr, map.size, input_pattern, input_pattern_size, memory_region_under_test_size, memory_region_under_test);
     if (res != TEE_SUCCESS)
         return res;
 
     struct crypto_hash_ctx* ctx = NULL;
-    res = crypto_hash_alloc_ctx(&ctx, TEE_ALG_SHA512);
+    res = crypto_hash_alloc_ctx((void**) &ctx, TEE_ALG_SHA512);
     if (res != TEE_SUCCESS)
         return res;
 
@@ -69,11 +185,11 @@ static TEE_Result invoke_command(
     if (res != TEE_SUCCESS)
         goto out;
 
-    res = crypto_hash_update(ctx, memory_region_under_test, memory_region_under_test_size);
+    res = crypto_hash_update(ctx, (const uint8_t*) memory_region_under_test, memory_region_under_test_size);
     if (res != TEE_SUCCESS)
         goto out;
 
-    res = crypto_hash_final(ctx, output_buf, output_buf_size);
+    res = crypto_hash_final(ctx, (uint8_t*) output_buf, output_buf_size);
 
 out:
     crypto_hash_free_ctx(ctx);
