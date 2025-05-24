@@ -13,7 +13,7 @@
 
 #define PTA_NAME "memread.pta"
 
-#define MEMREAD_THIS_VM_ID      0
+//#define MEMREAD_THIS_VM_ID      0
 
 
 struct vm_mem_mapping {
