@@ -1,3 +1,4 @@
+#include "compiler.h"
 #include "tee_api_defines.h"
 #include <string.h>
 #include <kernel/pseudo_ta.h>
@@ -5,19 +6,42 @@
 #include <mm/core_memprot.h>
 #include <pta_memread.h>
 
-//#include <tee_internal_api.h>
-//#include <tee_internal_api_extensions.h>
 #include <crypto/crypto.h>
 #include <tee_api_types.h>
 
-#include <config.h>
+//#include <config.h>
 
 #define PTA_NAME "memread.pta"
 
 #define MEMREAD_THIS_VM_ID      0
 
 
-int get_shared_ipc(struct vm_config* vm1, struct vm_config* vm2) {
+struct vm_mem_mapping {
+    size_t phy;
+    size_t size;
+};
+
+struct vm_mem_mapping_config {
+    size_t mappings_num;
+    struct vm_mem_mapping* mappings;
+};
+
+struct vm_mem_mapping_config config = {
+    .mappings_num = 2,
+    .mappings = (struct vm_mem_mapping[]){
+        [0] = {
+            .phy = 0x9000000,
+            .size = 0x200000
+        },
+        [1] = {
+            .phy = 0x9200000,
+            .size = 0x200000
+        }
+    }
+};
+
+
+/* int get_shared_ipc(struct vm_config* vm1, struct vm_config* vm2) {
     for (size_t i = 0; i < vm1->platform.ipc_num; i++) {
         for (size_t j = 0; j < vm2->platform.ipc_num; j++) {
             if (vm1->platform.ipcs[i].shmem_id == vm2->platform.ipcs[j].shmem_id)
@@ -70,12 +94,6 @@ int get_shmem_size(struct vm_config* vm, size_t shmem_id) {
     return -1;
 }
 
-struct vm_mem_mapping {
-    size_t phy;
-    size_t virt_offset;
-    size_t size;
-};
-
 int get_vm_memory_mapping(size_t vm_idx, struct vm_mem_mapping* cfg) {
     if (vm_idx >= config.vmlist_size) {
         return -1;
@@ -99,31 +117,25 @@ int get_vm_memory_mapping(size_t vm_idx, struct vm_mem_mapping* cfg) {
     cfg->phy = shared_ipc_base;
     cfg->size = shared_ipc_size;
 
-    size_t offset = 0;
-    for (size_t i = 0; i < vm_idx; i++) {
-        if (i == MEMREAD_THIS_VM_ID)
-            continue;
-
-        other_vm = config.vmlist[i];
-
-        int shmem_id = get_shared_ipc(this_vm, other_vm);
-        if (shmem_id < 0)
-            continue;
-
-        offset += config.shmemlist[shmem_id].size;
-    }
-
-    cfg->virt_offset = offset;
-
     return 0;
-}
+} */
 
 
-TEE_Result get_pattern_base_address_in_memory_region(size_t memory_start, size_t memory_size, const char* pattern, size_t pattern_size, size_t test_size, char* memory_to_hash) {
+TEE_Result get_pattern_base_address_in_memory_region(
+    size_t memory_start,
+    size_t memory_size,
+    const char* pattern,
+    size_t pattern_size,
+    size_t test_size,
+    char** memory_to_hash
+);
+
+
+TEE_Result get_pattern_base_address_in_memory_region(size_t memory_start, size_t memory_size, const char* pattern, size_t pattern_size, size_t test_size, char** memory_to_hash) {
     for (size_t i = memory_start; i < memory_start + memory_size - pattern_size - test_size + 1; i++) {
         char* offset = (char*) i;
         if (memcmp(offset, pattern, pattern_size) == 0) {
-            memory_to_hash = offset;
+            *memory_to_hash = offset;
             return TEE_SUCCESS;
         }
     }
@@ -133,12 +145,24 @@ TEE_Result get_pattern_base_address_in_memory_region(size_t memory_start, size_t
 
 
 static TEE_Result invoke_command(
-    void* sess_ctx,
-    uint32_t cmd_id,
+    void* sess_ctx __maybe_unused,
+    uint32_t cmd_id __maybe_unused,
     uint32_t param_types,
     TEE_Param params[TEE_NUM_PARAMS]
 ) {
     TEE_Result res;
+
+    uint8_t vm_index;
+    const char* input_pattern;
+    size_t input_pattern_size;
+    size_t memory_region_under_test_size;
+    char* output_buf;
+    size_t output_buf_size;
+
+    struct vm_mem_mapping map;
+    void* vaddr;
+    char* memory_region_under_test;
+    struct crypto_hash_ctx* ctx;
 
     uint32_t exp_param_types = TEE_PARAM_TYPES(
         TEE_PARAM_TYPE_VALUE_INPUT,
@@ -150,33 +174,34 @@ static TEE_Result invoke_command(
     if (param_types != exp_param_types)
         return TEE_ERROR_BAD_PARAMETERS;
 
-    uint8_t vm_index = (uint8_t) params[0].value.a;
+    vm_index = (uint8_t) params[0].value.a;
 
-    const char* input_pattern = (const char*) params[1].memref.buffer;
-    size_t input_pattern_size = params[1].memref.size;
+    input_pattern = (const char*) params[1].memref.buffer;
+    input_pattern_size = params[1].memref.size;
 
-    size_t memory_region_under_test_size = params[2].value.a;
+    memory_region_under_test_size = params[2].value.a;
 
-    char* output_buf = (char*) params[3].memref.buffer;
-    size_t output_buf_size = params[3].memref.size;
+    output_buf = (char*) params[3].memref.buffer;
+    output_buf_size = params[3].memref.size;
 
-    struct vm_mem_mapping map;
-    if (get_vm_memory_mapping(vm_index, &map) < 0)
+    if (vm_index >= config.mappings_num)
         return TEE_ERROR_BAD_PARAMETERS;
+    map = config.mappings[vm_index];
+    /*if (get_vm_memory_mapping(vm_index, &map) < 0)
+        return TEE_ERROR_BAD_PARAMETERS;*/
 
-    void* vaddr = core_mmu_add_mapping(MEM_AREA_IO_NSEC, map.phy, map.size);
+    vaddr = core_mmu_add_mapping(MEM_AREA_IO_NSEC, map.phy, map.size);
     if (vaddr == NULL)
         vaddr = phys_to_virt(map.phy, MEM_AREA_IO_NSEC, 1);
 
     if (vaddr == NULL)
         return TEE_ERROR_OUT_OF_MEMORY;
 
-    char* memory_region_under_test;
-    res = get_pattern_base_address_in_memory_region((size_t) vaddr, map.size, input_pattern, input_pattern_size, memory_region_under_test_size, memory_region_under_test);
+    res = get_pattern_base_address_in_memory_region((size_t) vaddr, map.size, input_pattern, input_pattern_size, memory_region_under_test_size, &memory_region_under_test);
     if (res != TEE_SUCCESS)
         return res;
 
-    struct crypto_hash_ctx* ctx = NULL;
+    ctx = NULL;
     res = crypto_hash_alloc_ctx((void**) &ctx, TEE_ALG_SHA512);
     if (res != TEE_SUCCESS)
         return res;
