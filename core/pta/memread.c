@@ -31,7 +31,7 @@ struct vm_mem_mapping_config config = {
     .mappings = (struct vm_mem_mapping[]){
         [0] = {
             .phy = 0x9000000,
-            .size = 0x200000
+            .size = 0x02000000
         },
         [1] = {
             .phy = 0x9200000,
@@ -172,9 +172,9 @@ static TEE_Result invoke_command(
 
     pattern_found = false;
     memory_offset = 0;
-    for (size_t block_offset = 0; block_offset < map.phy / PTA_MEMREAD_MEM_BLOCK_SIZE; block_offset++) {
+    for (size_t block_offset = 0; block_offset < map.size / PTA_MEMREAD_MEM_BLOCK_SIZE; block_offset++) {
         res = work_on_memory_block(
-            block_offset * PTA_MEMREAD_MEM_BLOCK_SIZE,
+            map.phy + block_offset * PTA_MEMREAD_MEM_BLOCK_SIZE,
             input_pattern, input_pattern_size,
             memory_region_under_test_size,
             &pattern_found,
