@@ -31,7 +31,7 @@ struct vm_mem_mapping_config config = {
     .mappings = (struct vm_mem_mapping[]){
         [0] = {
             .phy = 0x9000000,
-            .size = 0x02000000
+            .size = 0x2000000
         },
         [1] = {
             .phy = 0x9200000,
@@ -90,6 +90,7 @@ TEE_Result work_on_memory_block(size_t start_memory_address, const char* memory_
 
                 if (*memory_offset >= memory_pattern_size) {
                     *pattern_found = true;
+                    block_offset++;
                     break;
                 }
             } else {
