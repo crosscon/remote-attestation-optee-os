@@ -78,6 +78,8 @@ TEE_Result work_on_memory_block(size_t start_memory_address, const char* memory_
     if (virtual_start_addr == NULL)
         return TEE_ERROR_OUT_OF_MEMORY;
 
+    res = TEE_SUCCESS;
+
     char* block = (char*) virtual_start_addr;
     block_offset = 0;
 
@@ -96,7 +98,7 @@ TEE_Result work_on_memory_block(size_t start_memory_address, const char* memory_
         }
     }
 
-    if (*pattern_found) { // pattern was found, hash the entire or remaining part of the block
+    if (*pattern_found && area_to_hash_total_size - *memory_offset > 0 && PTA_MEMREAD_MEM_BLOCK_SIZE - block_offset > 0) { // pattern was found, hash the entire or remaining part of the block
         size_t bytes_to_hash =
             (area_to_hash_total_size - *memory_offset) >= (PTA_MEMREAD_MEM_BLOCK_SIZE - block_offset)
                 ? PTA_MEMREAD_MEM_BLOCK_SIZE - block_offset
