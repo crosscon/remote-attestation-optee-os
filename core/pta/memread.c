@@ -39,76 +39,255 @@ struct vm_mem_mapping_config config = {
 };
 
 
-TEE_Result work_on_memory_block(
-    size_t start_memory_address,                // where the physical memory region starts on the Pi
-    const char* memory_pattern,                 // pattern to look for
-    size_t memory_pattern_size,                 // len(^)
-    size_t area_to_hash_total_size,             // number of bytes to hash (incl. pattern)
-    bool* pattern_found,                        // was pattern found so far?
-    void* hash_ctx,                             // hash context to update
-    size_t* bytes_in_target_region_processed    // number of bytes in the target memory region worked on so far (no. of bytes matched in pattern/hashed in provided ctx)
+TEE_Result get_block_start_addr(
+    uint8_t vm_idx,
+    uint32_t block_idx,
+    paddr_t* start_addr
+);
+
+TEE_Result map_vm_mem(
+    uint8_t vm_idx,
+    uint32_t block_idx,
+    void** mem_ptr
+);
+
+TEE_Result unmap_vm_mem(
+    void* mem_ptr
+);
+
+TEE_Result determine_pattern_ending_block_offset(
+    uint8_t vm_idx,
+    uint32_t block_idx,
+    const char* pattern,
+    size_t pattern_size,
+    size_t* found_block_idx,
+    size_t* found_block_offset
+);
+
+TEE_Result hash_memory_under_test(
+    uint8_t vm_idx,
+    uint32_t block_idx,
+    size_t block_offset,
+    size_t memory_under_test_size,
+    struct crypto_hash_ctx* hash_ctx
+);
+
+TEE_Result work_on_memory(
+    uint8_t vm_idx,
+    uint32_t block_idx,
+    const char* pattern,
+    size_t pattern_size,
+    size_t memory_under_test_size,
+    uint8_t* output_buffer,
+    size_t output_buffer_size
 );
 
 
-TEE_Result work_on_memory_block(size_t start_memory_address, const char* memory_pattern, size_t memory_pattern_size, size_t area_to_hash_total_size, bool* pattern_found, void* hash_ctx, size_t* bytes_in_target_region_processed) {
+TEE_Result get_number_of_blocks(uint8_t vm_idx, size_t* num_blocks) {
+    if (vm_idx >= config.mappings_num)
+        return TEE_ERROR_ITEM_NOT_FOUND;
+
+    *num_blocks = config.mappings[vm_idx].size / PTA_MEMREAD_MEM_BLOCK_SIZE;
+    return TEE_SUCCESS;
+}
+
+TEE_Result get_block_start_addr(uint8_t vm_idx, uint32_t block_idx, paddr_t* start_addr) {
+    size_t num_blocks;
+    struct vm_mem_mapping vm;
+
+    if (vm_idx >= config.mappings_num)
+        return TEE_ERROR_ITEM_NOT_FOUND;
+
+    vm = config.mappings[vm_idx];
+    if (get_number_of_blocks(vm_idx, &num_blocks) != TEE_SUCCESS || block_idx >= num_blocks)
+        return TEE_ERROR_ITEM_NOT_FOUND;
+
+    *start_addr = vm.phy + block_idx * PTA_MEMREAD_MEM_BLOCK_SIZE;
+    return TEE_SUCCESS;
+}
+
+TEE_Result map_vm_mem(uint8_t vm_idx, uint32_t block_idx, void** mem_ptr) {
+    paddr_t block_start_addr;
+    void* ptr;
     TEE_Result res;
-    TEE_Result res_mem;
-    void* virtual_start_addr;
-    size_t block_offset;
 
-    virtual_start_addr = core_mmu_add_mapping(MEM_AREA_IO_NSEC, start_memory_address, PTA_MEMREAD_MEM_BLOCK_SIZE);
+    res = get_block_start_addr(vm_idx, block_idx, &block_start_addr);
+    if (res != TEE_SUCCESS)
+        return res;
 
-    if (virtual_start_addr == NULL)
-        virtual_start_addr = phys_to_virt(MEM_AREA_IO_NSEC, start_memory_address, PTA_MEMREAD_MEM_BLOCK_SIZE);
+    ptr = core_mmu_add_mapping(MEM_AREA_IO_NSEC, block_start_addr, PTA_MEMREAD_MEM_BLOCK_SIZE);
 
-    if (virtual_start_addr == NULL)
+    if (ptr == NULL)
+        ptr = phys_to_virt(MEM_AREA_IO_NSEC, block_start_addr, PTA_MEMREAD_MEM_BLOCK_SIZE);
+
+    if (ptr == NULL)
         return TEE_ERROR_OUT_OF_MEMORY;
 
-    res = TEE_SUCCESS;
+    *mem_ptr = ptr;
 
-    char* block = (char*) virtual_start_addr;
-    block_offset = 0;
+    return TEE_SUCCESS;
+}
 
-    if (!(*pattern_found)) { // pattern not found in previous blocks, looking for matches in memory
-        DMSG("[memread] Pattern not found in previous block(s), searching now\n");
-        for (block_offset = 0; block_offset < PTA_MEMREAD_MEM_BLOCK_SIZE; block_offset++) {
-            if (block[block_offset] == memory_pattern[*bytes_in_target_region_processed]) {
-                (*bytes_in_target_region_processed)++;
-                
-                if (*bytes_in_target_region_processed > 4)
-                    DMSG("[memread] Bytes matched so far: %d (address offset within block: %x)\n", *bytes_in_target_region_processed, block_offset);
+TEE_Result unmap_vm_mem(void* mem_ptr) {
+    return core_mmu_remove_mapping(MEM_AREA_IO_NSEC, mem_ptr, PTA_MEMREAD_MEM_BLOCK_SIZE);
+}
 
-                if (*bytes_in_target_region_processed >= memory_pattern_size) {
-                    *pattern_found = true;
-                    block_offset++;
-                    DMSG("[memread] Pattern found in memory, continuing with hashing\n");
-                    break;
-                }
-            } else {
-                *bytes_in_target_region_processed = 0;
-            }
+TEE_Result determine_pattern_ending_block_offset(
+    uint8_t vm_idx, uint32_t block_idx,
+    const char* pattern, size_t pattern_size,
+    size_t* found_block_idx, size_t* found_block_offset
+) {
+    return determine_pattern_ending_block_offset_recursively(
+        vm_idx, block_idx,
+        pattern, pattern_size, 0,
+        found_block_idx, found_block_offset,
+        false
+    );
+}
+
+TEE_Result determine_pattern_ending_block_offset_recursively(
+    uint8_t vm_idx, uint32_t block_idx,
+    const char* pattern, size_t pattern_size, size_t pattern_offset,
+    size_t* found_block_idx, size_t* found_block_offset,
+    bool early_cancel
+) {
+    TEE_Result res;
+    void* mem_ptr;
+    const char* block;
+    size_t offset_within_block;
+    bool pattern_found;
+
+    res = map_vm_mem(vm_idx, block_idx, &mem_ptr);
+    if (res != TEE_SUCCESS)
+        return res;
+
+    block = (const char*) mem_ptr;
+
+    pattern_found = false;
+    for (offset_within_block = 0; offset_within_block < PTA_MEMREAD_MEM_BLOCK_SIZE; offset_within_block++) {
+        if (block[offset_within_block] == pattern[pattern_offset])
+            pattern_offset++;
+        else {
+            pattern_offset = 0;
+            if (early_cancel)
+                break;
         }
-    } else {
-        DMSG("[memread] Pattern found in previous block(s), continuing hashing procedure\n");
+
+        if (pattern_offset == pattern_size) {
+            pattern_found = true;
+            break;
+        }
     }
 
-    if (*pattern_found && area_to_hash_total_size - *bytes_in_target_region_processed > 0 && PTA_MEMREAD_MEM_BLOCK_SIZE - block_offset > 0) { // pattern was found, hash the entire or remaining part of the block
-        size_t bytes_to_hash =
-            (area_to_hash_total_size - *bytes_in_target_region_processed) >= (PTA_MEMREAD_MEM_BLOCK_SIZE - block_offset)
-                ? PTA_MEMREAD_MEM_BLOCK_SIZE - block_offset
-                : area_to_hash_total_size - *bytes_in_target_region_processed;
+    res = unmap_vm_mem(mem_ptr);
+    if (res != TEE_SUCCESS)
+        return res;
 
-        DMSG("[memread] Hashing %x bytes of memory in this block (starting at %x)\n", bytes_to_hash, block_offset);
-
-        res = crypto_hash_update(hash_ctx, (const uint8_t*) block + block_offset, bytes_to_hash);
-        *bytes_in_target_region_processed += bytes_to_hash;
+    if (pattern_found) {
+        *found_block_idx = block_idx;
+        *found_block_offset = offset_within_block;
+        return TEE_SUCCESS;
     }
 
-    DMSG("[memread] Finished block");
+    if (!pattern_found && pattern_offset > 0) {
+        return determine_pattern_ending_block_offset_recursively(
+            vm_idx, block_idx + 1,
+            pattern, pattern_size,
+            pattern_offset,
+            found_block_idx,
+            found_block_offset,
+            true
+        );
+    }
 
-    res_mem = core_mmu_remove_mapping(MEM_AREA_IO_NSEC, virtual_start_addr, PTA_MEMREAD_MEM_BLOCK_SIZE);
-    if (res_mem != TEE_SUCCESS)
-        return res_mem;
+    size_t number_of_blocks;
+    if (get_number_of_blocks(vm_idx, &number_of_blocks) != TEE_SUCCESS || block_idx >= number_of_blocks - 1) {
+        return TEE_ERROR_ITEM_NOT_FOUND;
+    }
+
+    return TEE_ERROR_BUSY;
+}
+
+TEE_Result hash_memory_under_test(
+    uint8_t vm_idx, uint32_t block_idx, size_t block_offset,
+    size_t memory_under_test_size,
+    struct crypto_hash_ctx* hash_ctx
+) {
+    TEE_Result res;
+    size_t remaining;
+    size_t this_block_to_hash;
+    void* mem_ptr;
+
+    remaining = memory_under_test_size;
+    while (remaining > 0) {
+        res = map_vm_mem(vm_idx, block_idx, &mem_ptr);
+        if (res != TEE_SUCCESS)
+            return res;
+
+        this_block_to_hash = remaining >= PTA_MEMREAD_MEM_BLOCK_SIZE - block_offset
+            ? PTA_MEMREAD_MEM_BLOCK_SIZE - block_offset
+            : remaining;
+
+        res = crypto_hash_update(hash_ctx, (const uint8_t*) mem_ptr + block_offset, this_block_to_hash);
+        if (res != TEE_SUCCESS) {
+            unmap_vm_mem(mem_ptr);
+            return res;
+        }
+
+        remaining -= this_block_to_hash;
+        block_offset = 0;
+    }
+
+    return TEE_SUCCESS;
+}
+
+
+TEE_Result work_on_memory(
+    uint8_t vm_idx, uint32_t block_idx,
+    const char* pattern, size_t pattern_size,
+    size_t memory_under_test_size,
+    uint8_t* output_buffer, size_t output_buffer_size
+) {
+    TEE_Result res;
+
+    size_t found_block_idx;
+    size_t found_block_offset;
+
+    struct crypto_hash_ctx* ctx;
+
+    res = determine_pattern_ending_block_offset(
+        vm_idx, block_idx,
+        pattern, pattern_size,
+        &found_block_idx, &found_block_offset
+    );
+    if (res != TEE_SUCCESS)
+        return res;
+
+    ctx = NULL;
+    res = crypto_hash_alloc_ctx((void**) &ctx, TEE_ALG_SHA512);
+    if (res != TEE_SUCCESS)
+        return res;
+
+    res = crypto_hash_init(ctx);
+    if (res != TEE_SUCCESS)
+        goto out;
+
+    res = crypto_hash_update(ctx, (const uint8_t*) pattern, pattern_size);
+    if (res != TEE_SUCCESS)
+        goto out;
+
+    res = hash_memory_under_test(
+        vm_idx, found_block_idx,
+        found_block_offset,
+        memory_under_test_size,
+        ctx
+    );
+    if (res != TEE_SUCCESS)
+        goto out;
+
+    res = crypto_hash_finalize(ctx, output_buffer, output_buffer_size);
+out:
+    crypto_hash_free_ctx(ctx);
     return res;
 }
 
@@ -122,6 +301,7 @@ static TEE_Result invoke_command(
     TEE_Result res;
 
     uint8_t vm_index;
+    uint32_t block_index;
     const char* input_pattern;
     size_t input_pattern_size;
     size_t memory_region_under_test_size;
@@ -136,6 +316,9 @@ static TEE_Result invoke_command(
     size_t number_blocks_total;
     size_t block_physical_address;
 
+    if (cmd_id != PTA_MEMREAD_CMD_ATTEST_MEMORY)
+        return TEE_ERROR_NOT_SUPPORTED;
+
     uint32_t exp_param_types = TEE_PARAM_TYPES(
         TEE_PARAM_TYPE_VALUE_INPUT,
         TEE_PARAM_TYPE_MEMREF_INPUT,
@@ -147,6 +330,7 @@ static TEE_Result invoke_command(
         return TEE_ERROR_BAD_PARAMETERS;
 
     vm_index = (uint8_t) params[0].value.a;
+    block_index = params[0].value.b;
 
     input_pattern = (const char*) params[1].memref.buffer;
     input_pattern_size = params[1].memref.size;
@@ -165,52 +349,12 @@ static TEE_Result invoke_command(
         DMSG("0x%02x ", (unsigned char) input_pattern[i]);;
     DMSG("\n");
 
-    ctx = NULL;
-    res = crypto_hash_alloc_ctx((void**) &ctx, TEE_ALG_SHA512);
-    if (res != TEE_SUCCESS)
-        return res;
-
-    res = crypto_hash_init(ctx);
-    if (res != TEE_SUCCESS)
-        goto out;
-
-    res = crypto_hash_update(ctx, (const uint8_t*) input_pattern, input_pattern_size);
-    if (res != TEE_SUCCESS)
-        goto out;
-
-    pattern_found = false;
-    bytes_in_target_region_processed = 0;
-    number_blocks_total = map.size / PTA_MEMREAD_MEM_BLOCK_SIZE;
-
-    IMSG("[memread] Scanning memory for pattern & hashing it\n");
-    for (size_t block_offset = 0; block_offset < number_blocks_total; block_offset++) {
-        block_physical_address = map.phy + block_offset * PTA_MEMREAD_MEM_BLOCK_SIZE;
-        DMSG("[memread] Starting work on block %d/%d (start address: %x)\n", block_offset, number_blocks_total, block_physical_address);
-        res = work_on_memory_block(
-            block_physical_address,
-            input_pattern, input_pattern_size,
-            memory_region_under_test_size,
-            &pattern_found,
-            ctx,
-            &bytes_in_target_region_processed
-        );
-
-        if (bytes_in_target_region_processed >= memory_region_under_test_size)
-            break;
-    }
-
-    if (!pattern_found) {
-        IMSG("[memread] No pattern found!\n");
-        res = TEE_ERROR_ITEM_NOT_FOUND;
-        goto out;
-    }
-
-    res = crypto_hash_final(ctx, (uint8_t*) output_buf, output_buf_size);
-
-    IMSG("[memread] Hash finalized\n");
-out:
-    crypto_hash_free_ctx(ctx);
-    return res;
+    return work_on_memory(
+        vm_index, block_index,
+        input_pattern, input_pattern_size,
+        memory_region_under_test_size,
+        output_buf, output_buf_size
+    );
 }
 
 
